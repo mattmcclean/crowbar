@@ -98,7 +98,6 @@ trap cleanup 0 INT QUIT TERM
 [[ -f build-crowbar.conf ]] && \
     . "build-crowbar.conf"
 
-
 # Next, some configuration variables that can be used to tune how the 
 # build process works.
 
@@ -106,6 +105,43 @@ trap cleanup 0 INT QUIT TERM
 # the dependency machinery and the command line pull in the rest.
 # Note that BARCLAMPS is an array, not a string!
 [[ $BARCLAMPS ]] || BARCLAMPS=()
+
+# Default sources for barclamps.  You can add to these or override them
+# in one of your config files.  The format is:
+# BC_SOURCES["barclamp_name"]="repository_location tag_or_branch"
+# If tag_or_branch is missing, it is assumed to be master.
+declare -A BC_SOURCES
+# Core Crowbar barclamps.
+BC_SOURCES["crowbar"]="http://github.com/dellcloudedge/barclamp-crowbar.git"
+BC_SOURCES["deployer"]="http://github.com/dellcloudedge/barclamp-deployer.git"
+BC_SOURCES["dns"]="http://github.com/dellcloudedge/barclamp-dns.git"
+BC_SOURCES["ipmi"]="http://github.com/dellcloudedge/barclamp-ipmi.git"
+BC_SOURCES["logging"]="http://github.com/dellcloudedge/barclamp-logging.git"
+BC_SOURCES["nagios"]="http://github.com/dellcloudedge/barclamp-nagios.git"
+BC_SOURCES["network"]="http://github.com/dellcloudedge/barclamp-network.git"
+BC_SOURCES["ntp"]="http://github.com/dellcloudedge/barclamp-ntp.git"
+BC_SOURCES["provisioner"]="http://github.com/dellcloudedge/barclamp-provisioner.git"
+BC_SOURCES["redhat-install"]="http://github.com/dellcloudedge/barclamp-redhat-install.git"
+BC_SOURCES["test"]="http://github.com/dellcloudedge/barclamp-test.git"
+BC_SOURCES["ubuntu-install"]="http://github.com/dellcloudedge/barclamp-ubuntu-install.git"
+
+
+# Hashes to hold our "interesting" information.
+# Key = barclamp name
+# Value = whatever interesting thing we are looking for.
+declare -A BC_DEPS BC_GROUPS BC_PKGS BC_EXTRA_FILES BC_OS_DEPS BC_GEMS
+declare -A BC_REPOS BC_PPAS BC_RAW_PKGS BC_BUILD_PKGS BC_QUERY_STRINGS
+    
+# Query strings to pull info we are interested out of crowbar.yml
+BC_QUERY_STRINGS["deps"]="barclamp requires"
+BC_QUERY_STRINGS["groups"]="barclamp member"
+BC_QUERY_STRINGS["pkgs"]="$PKG_TYPE pkgs"
+BC_QUERY_STRINGS["extra_files"]="extra_files"
+BC_QUERY_STRINGS["os_support"]="barclamp os_support"
+BC_QUERY_STRINGS["gems"]="gems pkgs"
+BC_QUERY_STRINGS["repos"]="$PKG_TYPE repos"
+BC_QUERY_STRINGS["ppas"]="$PKG_TYPE ppas"
+BC_QUERY_STRINGS["build_pkgs"]="$PKG_TYPE build_pkgs"
 
 # Location for caches that should not be erased between runs
 [[ $CACHE_DIR ]] || CACHE_DIR="$HOME/.crowbar-build-cache"
@@ -130,6 +166,16 @@ trap cleanup 0 INT QUIT TERM
 # Command to run to clean out the tree before starting the build.
 # By default we want to be relatively pristine.
 [[ $VCS_CLEAN_CMD ]] || VCS_CLEAN_CMD='git clean -f -x -d'
+
+# If there is a config directory in the crowbar checkout,
+# source all the files in it.
+
+if [[ -d $CROWBAR_DIR/config.d ]]; then
+    for f in "$CROWBAR_DIR/config.d/"*".conf"; do
+	[[ -f $f ]] || continue
+	. "$f"
+    done
+fi
 
 # Arrays holding the additional pkgs and gems populate Crowbar with.
 PKGS=()
@@ -156,6 +202,8 @@ clean_dirs() {
 
 # Verify that the passed name is really a branch in the git repo.
 branch_exists() { git show-ref --quiet --verify --heads -- "refs/heads/$1"; }
+tag_exists() { git show-ref --quiet --verify --tags -- "refs/tags/$1"; }
+checkout_exists ( branch_exists "$1" || tag_exists "$1"; }
 
 # Run a git command in the crowbar repo.
 in_repo() ( cd "$CROWBAR_DIR"; "$@")
@@ -167,7 +215,87 @@ in_cache() (
     "$@"
 )
 
-is_barclamp() { [[ -f $CROWBAR_DIR/barclamps/$1/crowbar.yml ]]; }
+checkout_barclamp() {
+    [[ ${BC_SOURCES["$1"]} ]] || die "Don't know how to check out $1"
+    [[ -d $CROWBAR_DIR/barclamps/$1 ]] && \
+	die "Something has already created a directory named $1, cowardly refusing to continue."
+    mkdir -p "$CROWBAR_DIR/barclamps/$1"
+    cd "$CROWBAR_DIR/barclamps/$1"
+    git init . || die "Could not initialize git repository for $1"
+    local repo=${BC_SOURCES["$1"]%% *}
+    local branch=${BC_SOURCES["$1"]#* }
+    branch=${branch:-master}
+    git remote add origin "$repo"
+    git fetch --tags origin || \
+	die "Could not fetch git repository for $1"
+    git checkout "$branch" || \
+	die "Could not checkout $branch in $1"
+}
+
+is_barclamp() { 
+    # If the crowbar.yml file exists, then it is a barclamp.
+    [[ -f $CROWBAR_DIR/barclamps/$1/crowbar.yml ]] && return 0
+}
+
+sync_barclamp() {
+    is_barclamp "$1" || die "Cannot sync $1, it is not a barclamp!"
+    cd "$CROWBAR_DIR/barclamps/$1"
+    local branch=''
+    # if this barclamp is not a git repo, don't try to sync it.
+    [[ -f .git/config ]] || return 0
+    branch=$(git symbolic-ref -q)
+    branch="${branch##*/}"
+    [[ $branch ]] || die "$1 is not on a commit, cannot sync!"
+    # if we are on a tag, don't bother trying to sync.
+    tag_exists "$branch" && return 0
+    branch_exists "$branch" || die "$branch in $1 is not a branch!"
+    # If we do not have an origin, then just return
+    git symbolic-ref --quiet --verify --heads \
+	"refs/remotes/origin/$branch" || return 0
+    git fetch --tags origin
+    if ! git merge "origin/$branch"; then
+	git reset --hard
+	echo "Could not merge $branch in $1 with upstream."
+	die "Changes were undone, please merge manually."
+    fi
+    cd -
+}
+
+sync_barclamps() {
+    for d in "$CROWBAR_DIR/barclamps/"*; do
+	d="${d##*/}"
+	is_barclamp "$d" || continue
+	sync_barclamp "$d"
+    done
+}
+
+get_barclamp_metadata() {
+    is_barclamp "$1" || die "$1 is not a barclamp!"
+    yml_file="$CROWBAR_DIR/barclamps/$1/crowbar.yml"
+    for query in "${!BC_QUERY_STRINGS[@]}"; do
+	while read line; do
+	    [[ $line = nil ]] && continue
+	    case $query in
+		deps) BC_DEPS["$1"]+="$line ";;
+		groups) is_in "$line" ${BC_GROUPS["$1"]} || 
+		    BC_GROUPS["$line"]+="$1 ";;
+		pkgs) BC_PKGS["$1"]+="$line ";;
+		extra_files) BC_EXTRA_FILES["$1"]+="$line\n";;
+		os_support) BC_OS_SUPPORT["$1"]+="$line ";;
+		gems) BC_GEMS["$1"]+="$line ";;
+		repos) BC_REPOS["$1"]+="$line\n";;
+		ppas) [[ $PKG_TYPE = debs ]] || \
+		    die "Cannot declare a PPA for $PKG_TYPE!"
+		    BC_REPOS["$1"]+="ppa $line\n";;
+		build_pkgs) BC_BUILD_PKGS["$1"]+="$line ";;
+		*) die "Cannot handle query for $query."
+	    esac
+	done < <("$CROWBAR_DIR/parse_yml.rb" \
+	    "$yml_file" \
+	    ${BC_QUERY_STRINGS["$query"]} 2>/dev/null)
+    done
+}
+
 
 # Get the OS we were asked to stage Crowbar on to.  Assume it is Ubuntu 10.10
 # unless we specify otherwise.
@@ -312,6 +440,7 @@ fi
 		    BARCLAMPS+=("$1")
 		    shift
 		done;;
+	    --sync-barclamps) sync_barclamps; shift;;
 	    *) 	die "Unknown command line parameter $1";;
 	esac
     done
@@ -346,52 +475,11 @@ fi
 
     # Directory where we will look for our package lists
     [[ $PACKAGE_LISTS ]] || PACKAGE_LISTS="$BUILD_DIR/extra/packages"
-
-    # Hashes to hold our "interesting" information.
-    # Key = barclamp name
-    # Value = whatever interesting thing we are looking for.
-    declare -A BC_DEPS BC_GROUPS BC_PKGS BC_EXTRA_FILES BC_OS_DEPS BC_GEMS
-    declare -A BC_REPOS BC_PPAS BC_RAW_PKGS BC_BUILD_PKGS BC_QUERY_STRINGS
-    
-    # Query strings to pull info we are interested out of crowbar.yml
-    BC_QUERY_STRINGS["deps"]="barclamp requires"
-    BC_QUERY_STRINGS["groups"]="barclamp member"
-    BC_QUERY_STRINGS["pkgs"]="$PKG_TYPE pkgs"
-    BC_QUERY_STRINGS["extra_files"]="extra_files"
-    BC_QUERY_STRINGS["os_support"]="barclamp os_support"
-    BC_QUERY_STRINGS["gems"]="gems pkgs"
-    BC_QUERY_STRINGS["repos"]="$PKG_TYPE repos"
-    BC_QUERY_STRINGS["ppas"]="$PKG_TYPE ppas"
-    BC_QUERY_STRINGS["build_pkgs"]="$PKG_TYPE build_pkgs"
     
     # Pull in interesting information from all our barclamps
     for bc in $CROWBAR_DIR/barclamps/*; do
 	[[ -d $bc ]] || continue
-	bc=${bc##*/}
-	is_barclamp "$bc" || die "$bc is not a barclamp!"
-	yml_file="$CROWBAR_DIR/barclamps/$bc/crowbar.yml"
-	for query in "${!BC_QUERY_STRINGS[@]}"; do
-	    while read line; do
-		[[ $line = nil ]] && continue
-		case $query in
-		    deps) BC_DEPS["$bc"]+="$line ";;
-		    groups) is_in "$line" ${BC_GROUPS["$bc"]} || 
-			BC_GROUPS["$line"]+="$bc ";;
-		    pkgs) BC_PKGS["$bc"]+="$line ";;
-		    extra_files) BC_EXTRA_FILES["$bc"]+="$line\n";;
-		    os_support) BC_OS_SUPPORT["$bc"]+="$line ";;
-		    gems) BC_GEMS["$bc"]+="$line ";;
-		    repos) BC_REPOS["$bc"]+="$line\n";;
-		    ppas) [[ $PKG_TYPE = debs ]] || \
-			die "Cannot declare a PPA for $PKG_TYPE!"
-			BC_REPOS["$bc"]+="ppa $line\n";;
-		    build_pkgs) BC_BUILD_PKGS["$bc"]+="$line ";;
-		    *) die "Cannot handle query for $query."
-		esac
-	    done < <("$CROWBAR_DIR/parse_yml.rb" \
-		"$yml_file" \
-		${BC_QUERY_STRINGS["$query"]} 2>/dev/null)
-	done
+	get_barclamp_metadata "${bc##*/}"
     done
 
     # If any barclamps need group expansion, do it.
