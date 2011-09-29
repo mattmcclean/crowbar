@@ -135,12 +135,15 @@ BC_SOURCES["dns"]="http://github.com/dellcloudedge/barclamp-dns.git"
 BC_SOURCES["ipmi"]="http://github.com/dellcloudedge/barclamp-ipmi.git"
 BC_SOURCES["logging"]="http://github.com/dellcloudedge/barclamp-logging.git"
 BC_SOURCES["nagios"]="http://github.com/dellcloudedge/barclamp-nagios.git"
+BC_SOURCES["ganglia"]="http://github.com/dellcloudedge/barclamp-ganglia.git"
 BC_SOURCES["network"]="http://github.com/dellcloudedge/barclamp-network.git"
 BC_SOURCES["ntp"]="http://github.com/dellcloudedge/barclamp-ntp.git"
 BC_SOURCES["provisioner"]="http://github.com/dellcloudedge/barclamp-provisioner.git"
 BC_SOURCES["redhat-install"]="http://github.com/dellcloudedge/barclamp-redhat-install.git"
 BC_SOURCES["test"]="http://github.com/dellcloudedge/barclamp-test.git"
 BC_SOURCES["ubuntu-install"]="http://github.com/dellcloudedge/barclamp-ubuntu-install.git"
+# Core Crowbar group membership
+BC_GROUPS["crowbar"]="crowbar deployer dns ipmi logging nagios ganglia network ntp provisioner redhat-install test ubuntu-install"
 
 # Core Openstack Barclamps
 BC_SOURCES["keystone"]="http://github.com/dellcloudedge/barclamp-keystone.git"
@@ -149,10 +152,10 @@ BC_SOURCES["mysql"]="http://github.com/dellcloudedge/barclamp-mysql.git"
 BC_SOURCES["swift"]="http://github.com/dellcloudedge/barclamp-swift.git"
 BC_SOURCES["kong"]="http://github.com/dellcloudedge/barclamp-kong.git"
 BC_SOURCES["glance"]="http://github.com/dellcloudedge/barclamp-glance.git"
+BC_SOURCES["nova_dashboard"]="http://github.com/dellcloudedge/barclamp-nova_dashboard.git"
 
-# Declare some default groups
-BC_GROUPS["crowbar"]="crowbar deployer dns ipmi logging nagios network ntp provisioner redhat-install test ubuntu_install"
-BC_GROUPS["openstack"]="keystone nova mysql swift kong glance"
+# Core Openstack group membership
+BC_GROUPS["openstack"]="keystone nova mysql swift kong glance nova_dashboard"
 
 # Location for caches that should not be erased between runs
 [[ $CACHE_DIR ]] || CACHE_DIR="$HOME/.crowbar-build-cache"
@@ -232,16 +235,22 @@ checkout_barclamp() {
     [[ -d $CROWBAR_DIR/barclamps/$1 ]] && \
 	die "Something has already created a directory named $1, cowardly refusing to continue."
     mkdir -p "$CROWBAR_DIR/barclamps/$1"
-    in_barclamp "$1" git init . || die "Could not initialize git repository for $1"
+    in_barclamp "$1" git init . &>/dev/null || die "Could not initialize git repository for $1"
     local repo=${BC_SOURCES["$1"]%% *}
     local branch=${BC_SOURCES["$1"]#* }
     [[ $branch = $repo ]] && branch=master
-    in_barclamp "$1" git remote add origin "$repo"
-    in_barclamp "$1" git fetch origin || \
+    echo -n "Fetching barclamp $1... "
+    in_barclamp "$1" git remote add origin "$repo" &>/dev/null
+    in_barclamp "$1" git fetch origin &>/dev/null || {
+	rm -rf "$CROWBAR_DIR/barclamps/$1"
 	die "Could not fetch git repository for $1"
-    in_barclamp "$1" git checkout "$branch" || \
+    }
+    in_barclamp "$1" git checkout "$branch" &>/dev/null || {
+	rm -rf "$CROWBAR_DIR/barclamps/$1"
 	die "Could not checkout $branch in $1"
+    }
     get_barclamp_metadata "$1"
+    echo "Done."
 }
 
 is_barclamp() { 
@@ -251,7 +260,7 @@ is_barclamp() {
 	die "$CROWBAR_DIR/barclamps/$1 exists, but does not have crowbar.yml!"
     [[ ${BC_SOURCES["$1"]} ]] || \
 	die "Do not know how to check out $1, please manually add it to $CROWBAR_DIR/barclamps"
-    checkout_barclamp "$1"
+    checkout_barclamp "$1" || die "Could not check out barclamp $1"
 }
 
 sync_barclamp() {
@@ -271,7 +280,7 @@ sync_barclamp() {
     in_barclamp "$1" git fetch --tags origin
     if ! in_barclamp "$1" git merge "origin/$branch"; then
 	in_barclamp "$1" git reset --hard
-	echo "Could not merge $branch in $1 with upstream."
+	echo "Could not merge $branch in $1 with upstream." >&2
 	die "Changes were undone, please merge manually."
     fi
 }
@@ -291,18 +300,22 @@ get_barclamp_metadata() {
 	while read line; do
 	    [[ $line = nil ]] && continue
 	    case $query in
-		deps) BC_DEPS["$1"]+="$line ";;
-		groups) is_in "$line" ${BC_GROUPS["$1"]} || 
-		    BC_GROUPS["$line"]+="$1 ";;
-		pkgs) BC_PKGS["$1"]+="$line ";;
-		extra_files) BC_EXTRA_FILES["$1"]+="$line\n";;
-		os_support) BC_OS_SUPPORT["$1"]+="$line ";;
-		gems) BC_GEMS["$1"]+="$line ";;
-		repos) BC_REPOS["$1"]+="$line\n";;
+		deps) [[ $line = $1 ]] && die "$1 cannot depend on itself!"
+		    is_in "$line" ${BC_DEPS["$1"]} && continue
+		    BC_DEPS["$1"]+=" $line";;
+		groups) is_in "$line" ${BC_GROUPS["$1"]} && continue
+		    [[ $line = @* ]] && \
+			die "Cannot include a group in another group!"
+		    BC_GROUPS["$line"]+=" $1";;
+		pkgs) BC_PKGS["$1"]+=" $line";;
+		extra_files) BC_EXTRA_FILES["$1"]+="\n$line";;
+		os_support) BC_OS_SUPPORT["$1"]+=" $line";;
+		gems) BC_GEMS["$1"]+=" $line";;
+		repos) BC_REPOS["$1"]+="\n$line";;
 		ppas) [[ $PKG_TYPE = debs ]] || \
 		    die "Cannot declare a PPA for $PKG_TYPE!"
-		    BC_REPOS["$1"]+="ppa $line\n";;
-		build_pkgs) BC_BUILD_PKGS["$1"]+="$line ";;
+		    BC_REPOS["$1"]+="\nppa $line";;
+		build_pkgs) BC_BUILD_PKGS["$1"]+="\$line";;
 		*) die "Cannot handle query for $query."
 	    esac
 	done < <("$CROWBAR_DIR/parse_yml.rb" \
@@ -311,7 +324,21 @@ get_barclamp_metadata() {
     done
     # Add the dependency on the crowbar barclamp if it does not exist.
     [[ $1 = crowbar ]] || is_in crowbar ${BC_DEPS["$1"]} || \
-	BC_DEPS[$1]+="crowbar "
+	BC_DEPS[$1]+=" crowbar"
+}
+
+maybe_expand_group() {
+    local bc
+    for bc in "$@"; do
+	if [[ $bc != @* ]]; then
+	    is_barclamp "$bc" || return 1
+	    printf " %s" "$bc"
+	    continue
+	fi
+	bc=${bc#@}
+	[[ ${BC_GROUPS["$bc"]} ]] || return 1
+	maybe_expand_group ${BC_GROUPS["$bc"]} || return 1
+    done
 }
 
 # Get the OS we were asked to stage Crowbar on to.  Assume it is Ubuntu 10.10
@@ -499,27 +526,6 @@ fi
 	get_barclamp_metadata "${bc##*/}"
     done
 
-    # If any barclamps need group expansion, do it.
-    for bc in "${!BC_DEPS[@]}"; do
-	newdeps=''
-	for dep in ${BC_DEPS["$bc"]}; do
-	    if [[ $dep = @* ]]; then
-		[[ ${BC_GROUPS["${dep#@}"]} ]] || \
-		    die "$bc depends on group ${dep#@}, but that group does not exist!"
-		for d in ${BC_GROUPS["${dep#@}"]}; do
-		    is_barclamp "$d" || \
-			die "$bc depends on barclamp $d from group ${dep#@}, but $d does not exist!"
-		    newdeps+="$d "
-		done
-	    else
-		is_barclamp "$dep" || \
-		    die "$bc depends on barclamp $dep, but $dep is not a barclamp!"
-		newdeps+="$dep "
-	    fi
-	done
-	BC_DEPS["$bc"]="$newdeps"
-    done
-
     # Proxy Variables
     [[ $USE_PROXY ]] || USE_PROXY=0
     [[ $PROXY_HOST ]] || PROXY_HOST=""
@@ -538,30 +544,39 @@ fi
     # pull in all of the ones that claim to be in the crowbar group.
     [[ $BARCLAMPS ]] || BARCLAMPS=("@crowbar")
 
-    # Group-expand barclamps if needed, and unset groups after they are expanded.
-    for i in "${!BARCLAMPS[@]}"; do
-	bc="${BARCLAMPS[$i]}"
-	if [[ $bc = @* ]]; then
-	    [[ ${BC_GROUPS["${bc#@}"]} ]] || \
-		die "No such group ${bc#@}!"
-	    BARCLAMPS+=(${BC_GROUPS["${bc#@}"]})
-	    unset BARCLAMPS[$i]
-	else
-	    is_barclamp "$bc" || die "$bc is not a barclamp!"
-	fi
-    done
+    # Sync our barclamps if we were asked to.
+    [[ $BC_SYNC = true ]] && sync_barclamps
 
-    # Pull in dependencies for the barclamps.
-    new_barclamps=()
-    while [[ t = t ]]; do
+    # Group-expand and pull in barclamp dependencies, and unset groups after they are expanded.
+    
+    while [[ a = a ]]; do
 	for bc in "${BARCLAMPS[@]}"; do
-	    for dep in ${BC_DEPS["$bc"]}; do
-		is_in "$dep" "${new_barclamps[@]}" && continue
-		new_barclamps+=("$dep")
-	    done
-	    is_in "$bc" "${new_barclamps[@]}" || new_barclamps+=("$bc")
+	    if [[ $bc = @* ]]; then
+		[[ ${BC_GROUPS["${bc#@}"]} ]] || \
+		    die "No such group ${bc#@}!"
+		for dep in ${BC_GROUPS["${bc#@}"]}; do
+		    is_in "$dep" "${new_barclamps[@]}" || \
+			new_barclamps+=("$dep")
+		done
+	    else
+		is_barclamp "$bc" || die "$bc is not a barclamp!"
+		for dep in ${BC_DEPS["$bc"]}; do
+		    if [[ $dep = @* ]]; then
+			[[ ${BC_GROUPS["${dep#@}"]} ]] || \
+			    die "No such group ${dep#@}!"
+			for d in ${BC_GROUPS["${bc#@}"]}; do
+			    is_in "$d" "${new_barclamps[@]}" || \
+				new_barclamps+=("$d")
+			done
+		    else
+			is_in "$dep" "${new_barclamps[@]}" || \
+			    new_barclamps+=("$dep")
+		    fi
+		done
+		is_in "$bc" "${new_barclamps[@]}" || new_barclamps+=("$bc")
+	    fi
 	done
-	[[ ${BARCLAMPS[*]} = ${new_barclamps[*]} ]] && break
+	[[ ${new_barclamps[*]} = ${BARCLAMPS[*]} ]] && break
 	BARCLAMPS=("${new_barclamps[@]}")
     done
 
