@@ -106,6 +106,23 @@ trap cleanup 0 INT QUIT TERM
 # Note that BARCLAMPS is an array, not a string!
 [[ $BARCLAMPS ]] || BARCLAMPS=()
 
+# Hashes to hold our "interesting" information.
+# Key = barclamp name
+# Value = whatever interesting thing we are looking for.
+declare -A BC_DEPS BC_GROUPS BC_PKGS BC_EXTRA_FILES BC_OS_DEPS BC_GEMS
+declare -A BC_REPOS BC_PPAS BC_RAW_PKGS BC_BUILD_PKGS BC_QUERY_STRINGS
+    
+# Query strings to pull info we are interested out of crowbar.yml
+BC_QUERY_STRINGS["deps"]="barclamp requires"
+BC_QUERY_STRINGS["groups"]="barclamp member"
+BC_QUERY_STRINGS["pkgs"]="$PKG_TYPE pkgs"
+BC_QUERY_STRINGS["extra_files"]="extra_files"
+BC_QUERY_STRINGS["os_support"]="barclamp os_support"
+BC_QUERY_STRINGS["gems"]="gems pkgs"
+BC_QUERY_STRINGS["repos"]="$PKG_TYPE repos"
+BC_QUERY_STRINGS["ppas"]="$PKG_TYPE ppas"
+BC_QUERY_STRINGS["build_pkgs"]="$PKG_TYPE build_pkgs"
+
 # Default sources for barclamps.  You can add to these or override them
 # in one of your config files.  The format is:
 # BC_SOURCES["barclamp_name"]="repository_location tag_or_branch"
@@ -125,23 +142,17 @@ BC_SOURCES["redhat-install"]="http://github.com/dellcloudedge/barclamp-redhat-in
 BC_SOURCES["test"]="http://github.com/dellcloudedge/barclamp-test.git"
 BC_SOURCES["ubuntu-install"]="http://github.com/dellcloudedge/barclamp-ubuntu-install.git"
 
+# Core Openstack Barclamps
+BC_SOURCES["keystone"]="http://github.com/dellcloudedge/barclamp-keystone.git"
+BC_SOURCES["nova"]="http://github.com/dellcloudedge/barclamp-nova.git"
+BC_SOURCES["mysql"]="http://github.com/dellcloudedge/barclamp-mysql.git"
+BC_SOURCES["swift"]="http://github.com/dellcloudedge/barclamp-swift.git"
+BC_SOURCES["kong"]="http://github.com/dellcloudedge/barclamp-kong.git"
+BC_SOURCES["glance"]="http://github.com/dellcloudedge/barclamp-glance.git"
 
-# Hashes to hold our "interesting" information.
-# Key = barclamp name
-# Value = whatever interesting thing we are looking for.
-declare -A BC_DEPS BC_GROUPS BC_PKGS BC_EXTRA_FILES BC_OS_DEPS BC_GEMS
-declare -A BC_REPOS BC_PPAS BC_RAW_PKGS BC_BUILD_PKGS BC_QUERY_STRINGS
-    
-# Query strings to pull info we are interested out of crowbar.yml
-BC_QUERY_STRINGS["deps"]="barclamp requires"
-BC_QUERY_STRINGS["groups"]="barclamp member"
-BC_QUERY_STRINGS["pkgs"]="$PKG_TYPE pkgs"
-BC_QUERY_STRINGS["extra_files"]="extra_files"
-BC_QUERY_STRINGS["os_support"]="barclamp os_support"
-BC_QUERY_STRINGS["gems"]="gems pkgs"
-BC_QUERY_STRINGS["repos"]="$PKG_TYPE repos"
-BC_QUERY_STRINGS["ppas"]="$PKG_TYPE ppas"
-BC_QUERY_STRINGS["build_pkgs"]="$PKG_TYPE build_pkgs"
+# Declare some default groups
+BC_GROUPS["crowbar"]="crowbar deployer dns ipmi logging nagios network ntp provisioner redhat-install test ubuntu_install"
+BC_GROUPS["openstack"]="keystone nova mysql swift kong glance"
 
 # Location for caches that should not be erased between runs
 [[ $CACHE_DIR ]] || CACHE_DIR="$HOME/.crowbar-build-cache"
@@ -203,10 +214,11 @@ clean_dirs() {
 # Verify that the passed name is really a branch in the git repo.
 branch_exists() { git show-ref --quiet --verify --heads -- "refs/heads/$1"; }
 tag_exists() { git show-ref --quiet --verify --tags -- "refs/tags/$1"; }
-checkout_exists ( branch_exists "$1" || tag_exists "$1"; }
+checkout_exists() { branch_exists "$1" || tag_exists "$1"; }
 
 # Run a git command in the crowbar repo.
 in_repo() ( cd "$CROWBAR_DIR"; "$@")
+in_barclamp() ( cd "$CROWBAR_DIR/barclamps/$1"; shift; "$@")
 
 # Run a git command in the build cache, assuming it is a git repository. 
 in_cache() (
@@ -220,45 +232,48 @@ checkout_barclamp() {
     [[ -d $CROWBAR_DIR/barclamps/$1 ]] && \
 	die "Something has already created a directory named $1, cowardly refusing to continue."
     mkdir -p "$CROWBAR_DIR/barclamps/$1"
-    cd "$CROWBAR_DIR/barclamps/$1"
-    git init . || die "Could not initialize git repository for $1"
+    in_barclamp "$1" git init . || die "Could not initialize git repository for $1"
     local repo=${BC_SOURCES["$1"]%% *}
     local branch=${BC_SOURCES["$1"]#* }
-    branch=${branch:-master}
-    git remote add origin "$repo"
-    git fetch --tags origin || \
+    [[ $branch = $repo ]] && branch=master
+    in_barclamp "$1" git remote add origin "$repo"
+    in_barclamp "$1" git fetch origin || \
 	die "Could not fetch git repository for $1"
-    git checkout "$branch" || \
+    in_barclamp "$1" git checkout "$branch" || \
 	die "Could not checkout $branch in $1"
+    get_barclamp_metadata "$1"
 }
 
 is_barclamp() { 
     # If the crowbar.yml file exists, then it is a barclamp.
     [[ -f $CROWBAR_DIR/barclamps/$1/crowbar.yml ]] && return 0
+    [[ -d $CROWBAR_DIR/barclamps/$1 ]] && \
+	die "$CROWBAR_DIR/barclamps/$1 exists, but does not have crowbar.yml!"
+    [[ ${BC_SOURCES["$1"]} ]] || \
+	die "Do not know how to check out $1, please manually add it to $CROWBAR_DIR/barclamps"
+    checkout_barclamp "$1"
 }
 
 sync_barclamp() {
     is_barclamp "$1" || die "Cannot sync $1, it is not a barclamp!"
-    cd "$CROWBAR_DIR/barclamps/$1"
     local branch=''
     # if this barclamp is not a git repo, don't try to sync it.
-    [[ -f .git/config ]] || return 0
-    branch=$(git symbolic-ref -q)
+    [[ -f $CROWBAR_DIR/barclamps/$1/.git/config ]] || return 0
+    branch=$(in_barclamp "$1" git symbolic-ref -q HEAD)
     branch="${branch##*/}"
     [[ $branch ]] || die "$1 is not on a commit, cannot sync!"
     # if we are on a tag, don't bother trying to sync.
-    tag_exists "$branch" && return 0
-    branch_exists "$branch" || die "$branch in $1 is not a branch!"
+    in_barclamp "$1" tag_exists "$branch" && return 0
+    in_barclamp "$1" branch_exists "$branch" || die "$branch in $1 is not a branch!"
     # If we do not have an origin, then just return
-    git symbolic-ref --quiet --verify --heads \
+    in_barclamp "$1" git show-ref --quiet --verify --heads \
 	"refs/remotes/origin/$branch" || return 0
-    git fetch --tags origin
-    if ! git merge "origin/$branch"; then
-	git reset --hard
+    in_barclamp "$1" git fetch --tags origin
+    if ! in_barclamp "$1" git merge "origin/$branch"; then
+	in_barclamp "$1" git reset --hard
 	echo "Could not merge $branch in $1 with upstream."
 	die "Changes were undone, please merge manually."
     fi
-    cd -
 }
 
 sync_barclamps() {
@@ -294,8 +309,10 @@ get_barclamp_metadata() {
 	    "$yml_file" \
 	    ${BC_QUERY_STRINGS["$query"]} 2>/dev/null)
     done
+    # Add the dependency on the crowbar barclamp if it does not exist.
+    [[ $1 = crowbar ]] || is_in crowbar ${BC_DEPS["$1"]} || \
+	BC_DEPS[$1]+="crowbar "
 }
-
 
 # Get the OS we were asked to stage Crowbar on to.  Assume it is Ubuntu 10.10
 # unless we specify otherwise.
@@ -440,7 +457,7 @@ fi
 		    BARCLAMPS+=("$1")
 		    shift
 		done;;
-	    --sync-barclamps) sync_barclamps; shift;;
+	    --sync-barclamps) BC_SYNC=true; shift;;
 	    *) 	die "Unknown command line parameter $1";;
 	esac
     done
@@ -518,16 +535,9 @@ fi
     [[ $BUILT_ISO ]] || BUILT_ISO="crowbar-${VERSION}.iso"
 
     # If we were not passed a list of barclamps to include,
-    # pull in all of the ones declared as submodules.
-    [[ $BARCLAMPS ]] || BARCLAMPS=($(cd "$CROWBAR_DIR"
-	    while read sha submod branch; do
-		[[ $submod = barclamps/* ]] || continue
-		[[ -f $submod/crowbar.yml ]] || \
-		    echo "Cannot find crowbar.yml for $submod, exiting."
-		echo "${submod##*/}"
-	    done < <(git submodule status))
-	)
-    
+    # pull in all of the ones that claim to be in the crowbar group.
+    [[ $BARCLAMPS ]] || BARCLAMPS=("@crowbar")
+
     # Group-expand barclamps if needed, and unset groups after they are expanded.
     for i in "${!BARCLAMPS[@]}"; do
 	bc="${BARCLAMPS[$i]}"
@@ -540,7 +550,6 @@ fi
 	    is_barclamp "$bc" || die "$bc is not a barclamp!"
 	fi
     done
-    BARCLAMPS=("${BARCLAMPS[@]//@*}")
 
     # Pull in dependencies for the barclamps.
     new_barclamps=()
