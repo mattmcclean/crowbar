@@ -36,7 +36,7 @@
 	url = http://github.com/dellcloudedge/barclamp-ubuntu-install.git
 [submodule "barclamps/nova"]
         path = barclamps/nova
-        url = http://github.com/dellcloudedge/barclamp-nova.git
+	url = http://github.com/mattmcclean/barclamp-nova.git
 [submodule "barclamps/swift"]
         path = barclamps/swift
         url = http://github.com/dellcloudedge/barclamp-swift.git
@@ -58,3 +58,6 @@
 [submodule "barclamps/keystone"]
 	path = barclamps/keystone
 	url = http://github.com/dellcloudedge/barclamp-keystone.git
+[submodule "barclamps/quantum"]
+	path = barclamps/quantum
+	url = http://github.com/mattmcclean/barclamp-quantum.git
