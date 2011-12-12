@@ -54,7 +54,7 @@
         url = http://github.com/dellcloudedge/barclamp-nova_dashboard.git
 [submodule "barclamps/openstack"]
 	path = barclamps/openstack
-	url = http://github.com/dellcloudedge/barclamp-openstack.git
+	url = http://github.com/mattmcclean/barclamp-openstack.git
 [submodule "barclamps/keystone"]
 	path = barclamps/keystone
 	url = http://github.com/dellcloudedge/barclamp-keystone.git
